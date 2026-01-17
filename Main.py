@@ -10,21 +10,22 @@ import os
 from accelerate import notebook_launcher
 import torch.nn.functional as F
 from diffusers import UNet2DModel, DDPMScheduler, DDPMPipeline
-
+from diffusers.optimization import get_cosine_schedule_with_warmup
+print("imports finnished")
 
 @dataclass
 class TrainingConfig:
-    image_size = 128  # the generated image resolution
+    image_size = 64 #default 128  # the generated image resolution
     train_batch_size = 16
     eval_batch_size = 16  # how many images to sample during evaluation
-    num_epochs = 50
+    num_epochs = 1 #default 50
     gradient_accumulation_steps = 1
     learning_rate = 1e-4
-    lr_warmup_steps = 500
-    save_image_epochs = 10
-    save_model_epochs = 30
+    lr_warmup_steps = 0#default 500
+    save_image_epochs = 1#default 10
+    save_model_epochs = 1#default 30
     mixed_precision = "fp16"  # `no` for float32, `fp16` for automatic mixed precision
-    output_dir = "ddpm-butterflies-128"  # the model name locally and on the HF Hub
+    output_dir = "food-test"  # the model name locally and on the HF Hub
 
     push_to_hub = False # whether to upload the saved model to the HF Hub
     hub_model_id = "<your-username>/<my-awesome-model>"  # the name of the repository to create on the HF Hub
@@ -36,11 +37,8 @@ class TrainingConfig:
 config = TrainingConfig()
 
 # 2. Dataset Selection
-config.dataset_name = "huggan/smithsonian_butterflies_subset"
+config.dataset_name = "mrdbourke/FoodExtract-1k-Vision"
 dataset = load_dataset(config.dataset_name, split="train")
-
-# dataset selction
-dataset = load_dataset("huggan/smithsonian_butterflies_subset", split="train")
 
 
 # resize image into same size
@@ -90,6 +88,18 @@ model = UNet2DModel(
     ),
 )
 
+import torch
+from PIL import Image
+from diffusers import DDPMScheduler
+
+noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+lr_scheduler = get_cosine_schedule_with_warmup(
+    optimizer=optimizer,
+    num_warmup_steps=config.lr_warmup_steps,
+    num_training_steps=(len(train_dataloader) * config.num_epochs),
+)
 
 def evaluate(config, epoch, pipeline):
     # Generate a few images to check progress
@@ -144,7 +154,7 @@ def train_loop(TrainingConfig, model, noise_scheduler, optimizer, train_dataload
 
             # Sample a random timestep for each image
             timesteps = torch.randint(
-                0, noise_scheduler.TrainingConfig.num_train_timesteps, (bs,), device=clean_images.device,
+                0, noise_scheduler.config.num_train_timesteps, (bs,), device=clean_images.device,
                 dtype=torch.int64
             )
 
@@ -189,6 +199,6 @@ def train_loop(TrainingConfig, model, noise_scheduler, optimizer, train_dataload
                     pipeline.save_pretrained(TrainingConfig.output_dir)
 
 
-args = (TrainingTrainingConfig, model, noise_scheduler, optimizer, train_dataloader, lr_scheduler)
+args = (config, model, noise_scheduler, optimizer, train_dataloader, lr_scheduler)
 
 notebook_launcher(train_loop, args, num_processes=1)
