@@ -9,23 +9,29 @@ from pathlib import Path
 import os
 from accelerate import notebook_launcher
 import torch.nn.functional as F
-from diffusers import UNet2DModel, DDPMScheduler, DDPMPipeline
+from diffusers import DDPMScheduler, DDPMPipeline, UNet2DConditionModel
 from diffusers.optimization import get_cosine_schedule_with_warmup
+from transformers import CLIPTokenizer, CLIPTextModel
+import re
+
+
 print("imports finnished")
 
 @dataclass
 class TrainingConfig:
-    image_size = 64 #default 128  # the generated image resolution
+    image_size = 128 #default 128  # the generated image resolution
     train_batch_size = 16
-    eval_batch_size = 16  # how many images to sample during evaluation
+    eval_batch_size = 10 # how many images to sample during evaluation
     num_epochs = 1 #default 50
     gradient_accumulation_steps = 1
     learning_rate = 1e-4
-    lr_warmup_steps = 0#default 500
-    save_image_epochs = 1#default 10
-    save_model_epochs = 1#default 30
+    lr_warmup_steps = 20#default 500
+    save_image_epochs = 10#default 10
+    save_model_epochs = 15#default 30
     mixed_precision = "fp16"  # `no` for float32, `fp16` for automatic mixed precision
     output_dir = "food-test"  # the model name locally and on the HF Hub
+    pretrained_model_name_or_path = "openai/clip-vit-base-patch32"  # The text encoder
+
 
     push_to_hub = False # whether to upload the saved model to the HF Hub
     hub_model_id = "<your-username>/<my-awesome-model>"  # the name of the repository to create on the HF Hub
@@ -33,12 +39,40 @@ class TrainingConfig:
     overwrite_output_dir = True  # overwrite the old model when re-running the notebook
     seed = 0
 
-# 1. Initialize Config FIRST
+
+
 config = TrainingConfig()
 
-# 2. Dataset Selection
-config.dataset_name = "mrdbourke/FoodExtract-1k-Vision"
-dataset = load_dataset(config.dataset_name, split="train")
+tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-base-patch32")
+text_encoder.requires_grad_(False)
+
+model = UNet2DConditionModel(
+    sample_size=TrainingConfig.image_size,  # the target image resolution
+    in_channels=3,  # the number of input channels, 3 for RGB images
+    out_channels=3,  # the number of output channels
+    layers_per_block=2,  # how many ResNet layers to use per UNet block
+    block_out_channels=(128, 256, 512, 512),  # the number of output channels for each UNet block
+    down_block_types=(
+        "DownBlock2D",  # a regular ResNet downsampling block
+        "CrossAttnDownBlock2D",
+        "CrossAttnDownBlock2D",
+        "DownBlock2D",
+    ),
+    up_block_types=(
+        "UpBlock2D",  # a regular ResNet upsampling block
+        "CrossAttnUpBlock2D",
+        "CrossAttnUpBlock2D",
+        "UpBlock2D",
+
+    ),
+    cross_attention_dim=512
+)
+
+
+
+
+noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
 
 
 # resize image into same size
@@ -51,69 +85,106 @@ preprocess = transforms.Compose(
     ]
 )
 
+#transform data to be ready to train
+def transform(instance):
+    images = [preprocess(image.convert("RGB")) for image in instance["image"]]
+    captions = []
 
-def transform(examples):
-    images = [preprocess(image.convert("RGB")) for image in examples["image"]]
-    return {"images": images}
+
+    #for every image in the dataset
+    for i in range(len(instance["image"])):
+
+        food_name = instance["food101_class_name"][i]
+
+        raw_text = instance["qwen3_vl_8b_yaml_out"][i]
+        if raw_text:
+            ingredients = re.sub(r'\s*\(.*?\)', '', raw_text).strip()
+        else:
+            ingredients = "Various ingrediants"
+        food_description = instance["output_label_json"][i]
+
+        prompt = f"Make me {food_name} {food_description} made out of {ingredients}"
+
+        captions.append(prompt)
+
+    inputs = tokenizer(
+        captions,
+        max_length=tokenizer.model_max_length,
+        padding = "max_length",
+        truncation=True,
+        return_tensors="pt"
+
+    )
+    return {"images": images,
+            "input_ids": inputs.input_ids
+    }
+
+
+dataset = load_dataset("mrdbourke/FoodExtract-1k-Vision", split="train")
+
 
 # Apply the transform to the dataset
 dataset.set_transform(transform)
 
-
-
 # Initialize trainer
 train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=TrainingConfig.train_batch_size, shuffle=True)
 
-model = UNet2DModel(
-    sample_size=TrainingConfig.image_size,  # the target image resolution
-    in_channels=3,  # the number of input channels, 3 for RGB images
-    out_channels=3,  # the number of output channels
-    layers_per_block=2,  # how many ResNet layers to use per UNet block
-    block_out_channels=(128, 128, 256, 256, 512, 512),  # the number of output channels for each UNet block
-    down_block_types=(
-        "DownBlock2D",  # a regular ResNet downsampling block
-        "DownBlock2D",
-        "DownBlock2D",
-        "DownBlock2D",
-        "AttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
-        "DownBlock2D",
-    ),
-    up_block_types=(
-        "UpBlock2D",  # a regular ResNet upsampling block
-        "AttnUpBlock2D",  # a ResNet upsampling block with spatial self-attention
-        "UpBlock2D",
-        "UpBlock2D",
-        "UpBlock2D",
-        "UpBlock2D",
-    ),
-)
-
-import torch
-from PIL import Image
-from diffusers import DDPMScheduler
-
-noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
-
 optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+
 lr_scheduler = get_cosine_schedule_with_warmup(
     optimizer=optimizer,
     num_warmup_steps=config.lr_warmup_steps,
     num_training_steps=(len(train_dataloader) * config.num_epochs),
 )
 
-def evaluate(config, epoch, pipeline):
-    # Generate a few images to check progress
-    images = pipeline(
-        batch_size=config.eval_batch_size,
-        generator=torch.manual_seed(config.seed),
-    ).images
+def evaluate(config, epoch, model, noise_scheduler, text_encoder, tokenizer, device):
+    # Define a prompt to test
+    prompt = ["A hamburger with cheese and lettuce", "A delicious slice of pizza", "Sushi rolls on a plate",
+              "Ice cream with chocolate sauce"]
+    # Adjust prompt list size to match eval_batch_size
+    prompt = prompt[:config.eval_batch_size]
 
-    # Save images locally
+    # 1. Encode Text
+    text_inputs = tokenizer(
+        prompt,
+        padding="max_length",
+        max_length=tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt"
+    )
+    with torch.no_grad():
+        text_embeddings = text_encoder(text_inputs.input_ids.to(device))[0]
+
+    # 2. Prepare random noise
+    images = torch.randn(
+        (len(prompt), model.config.in_channels, model.config.sample_size, model.config.sample_size),
+        device=device,
+    )
+
+    # 3. Denoising Loop
+    model.eval()
+    for t in tqdm(noise_scheduler.timesteps, desc="Sampling"):
+        with torch.no_grad():
+            # Apply classifier-free guidance if you wanted to, but for now simple conditioning:
+            model_output = model(images, t, encoder_hidden_states=text_embeddings).sample
+
+            # Update images using scheduler
+            images = noise_scheduler.step(model_output, t, images).prev_sample
+
+    # 4. Save Images
+    images = (images / 2 + 0.5).clamp(0, 1)
+    images = images.cpu().permute(0, 2, 3, 1).numpy()
+
+    # Convert to PIL and save
     image_dir = os.path.join(config.output_dir, "samples")
     os.makedirs(image_dir, exist_ok=True)
-    for i, img in enumerate(images):
-        img.save(f"{image_dir}/{epoch:04d}_{i}.png")
 
+    from PIL import Image
+    for i, img_array in enumerate(images):
+        img = Image.fromarray((img_array * 255).round().astype("uint8"))
+        img.save(f"{image_dir}/{epoch:04d}_{prompt[i].replace(' ', '_')}.png")
+
+    model.train()  # Set back to train mode
 
 def train_loop(TrainingConfig, model, noise_scheduler, optimizer, train_dataloader, lr_scheduler):
     # Initialize accelerator and tensorboard logging
@@ -132,6 +203,8 @@ def train_loop(TrainingConfig, model, noise_scheduler, optimizer, train_dataload
             ).repo_id
         accelerator.init_trackers("train_example")
 
+    text_encoder.to(accelerator.device)
+
     # Prepare everything
     # There is no specific order to remember, you just need to unpack the
     # objects in the same order you gave them to the prepare method.
@@ -148,6 +221,7 @@ def train_loop(TrainingConfig, model, noise_scheduler, optimizer, train_dataload
 
         for step, batch in enumerate(train_dataloader):
             clean_images = batch["images"]
+            input_ids = batch["input_ids"]
             # Sample noise to add to the images
             noise = torch.randn(clean_images.shape, device=clean_images.device)
             bs = clean_images.shape[0]
@@ -158,13 +232,19 @@ def train_loop(TrainingConfig, model, noise_scheduler, optimizer, train_dataload
                 dtype=torch.int64
             )
 
+            # We must do this inside torch.no_grad() because we aren't training the text encoder
+            with torch.no_grad():
+                # The text encoder must be on the same device (GPU) as the input_ids
+                # If using accelerator, it handles device placement usually,
+                # but ensure text_encoder is moved to accelerator.device before the loop starts
+                encoder_hidden_states = text_encoder(input_ids.to(accelerator.device))[0]
+
             # Add noise to the clean images according to the noise magnitude at each timestep
-            # (this is the forward diffusion process)
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
             with accelerator.accumulate(model):
                 # Predict the noise residual
-                noise_pred = model(noisy_images, timesteps, return_dict=False)[0]
+                noise_pred = model(noisy_images, timesteps, encoder_hidden_states=encoder_hidden_states).sample
                 loss = F.mse_loss(noise_pred, noise)
                 accelerator.backward(loss)
 
@@ -180,23 +260,18 @@ def train_loop(TrainingConfig, model, noise_scheduler, optimizer, train_dataload
             accelerator.log(logs, step=global_step)
             global_step += 1
 
+
+        unwrapped_model =  accelerator.unwrap_model(model)
+
         # After each epoch you optionally sample some demo images with evaluate() and save the model
         if accelerator.is_main_process:
-            pipeline = DDPMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler)
-
             if (epoch + 1) % TrainingConfig.save_image_epochs == 0 or epoch == TrainingConfig.num_epochs - 1:
-                evaluate(TrainingConfig, epoch, pipeline)
+                evaluate(TrainingConfig, epoch, unwrapped_model, noise_scheduler, text_encoder, tokenizer, accelerator.device)
 
             if (epoch + 1) % TrainingConfig.save_model_epochs == 0 or epoch == TrainingConfig.num_epochs - 1:
-                if TrainingConfig.push_to_hub:
-                    upload_folder(
-                        repo_id=repo_id,
-                        folder_path=TrainingConfig.output_dir,
-                        commit_message=f"Epoch {epoch}",
-                        ignore_patterns=["step_*", "epoch_*"],
-                    )
-                else:
-                    pipeline.save_pretrained(TrainingConfig.output_dir)
+                unwrapped_model.save_pretrained(os.path.join(config.output_dir, "model"))
+
+                tokenizer.save_pretrained(os.path.join(config.output_dir, "tokenizer"))
 
 
 args = (config, model, noise_scheduler, optimizer, train_dataloader, lr_scheduler)
