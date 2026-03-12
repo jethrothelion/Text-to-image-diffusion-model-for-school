@@ -1,3 +1,5 @@
+## MAKE SURE TOO INSTALL PYTORCH WITH RESPECT TO YOUR PLATFORM AT https://pytorch.org/get-started/locally/
+
 from dataclasses import dataclass
 from datasets import load_dataset
 from torchvision import transforms
@@ -14,20 +16,20 @@ from diffusers.optimization import get_cosine_schedule_with_warmup
 from transformers import CLIPTokenizer, CLIPTextModel
 import re
 
+print("imports finished")
 
-print("imports finnished")
 
 @dataclass
 class TrainingConfig:
-    image_size = 128 #default 128  # the generated image resolution
+    image_size = 512 #default 128  # the generated image resolution
     train_batch_size = 16
     eval_batch_size = 10 # how many images to sample during evaluation
-    num_epochs = 1 #default 50
+    num_epochs = 70 #default 50
     gradient_accumulation_steps = 1
     learning_rate = 1e-4
-    lr_warmup_steps = 20#default 500
+    lr_warmup_steps = 500#default 500
     save_image_epochs = 10#default 10
-    save_model_epochs = 15#default 30
+    save_model_epochs = 30#default 30
     mixed_precision = "fp16"  # `no` for float32, `fp16` for automatic mixed precision
     output_dir = "food-test"  # the model name locally and on the HF Hub
     pretrained_model_name_or_path = "openai/clip-vit-base-patch32"  # The text encoder
@@ -43,8 +45,8 @@ class TrainingConfig:
 
 config = TrainingConfig()
 
-tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
-text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-base-patch32")
+tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
 text_encoder.requires_grad_(False)
 
 model = UNet2DConditionModel(
@@ -66,7 +68,7 @@ model = UNet2DConditionModel(
         "UpBlock2D",
 
     ),
-    cross_attention_dim=512
+    cross_attention_dim=768
 )
 
 
@@ -139,7 +141,7 @@ lr_scheduler = get_cosine_schedule_with_warmup(
 
 def evaluate(config, epoch, model, noise_scheduler, text_encoder, tokenizer, device):
     # Define a prompt to test
-    prompt = ["A hamburger with cheese and lettuce", "A delicious slice of pizza", "Sushi rolls on a plate",
+    prompt = ["A hamburger with cheese and lettuce", "A delicious slice of pizza with various ingrediants", "Sushi rolls on a plate",
               "Ice cream with chocolate sauce"]
     # Adjust prompt list size to match eval_batch_size
     prompt = prompt[:config.eval_batch_size]
