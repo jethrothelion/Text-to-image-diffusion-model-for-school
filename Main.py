@@ -1,5 +1,6 @@
 ## MAKE SURE TOO INSTALL PYTORCH WITH RESPECT TO YOUR PLATFORM AT https://pytorch.org/get-started/locally/
 
+import random
 from dataclasses import dataclass
 from datasets import load_dataset
 from torchvision import transforms
@@ -11,7 +12,7 @@ from pathlib import Path
 import os
 from accelerate import notebook_launcher
 import torch.nn.functional as F
-from diffusers import DDPMScheduler, DDPMPipeline, UNet2DConditionModel
+from diffusers import DDPMScheduler, DDPMPipeline, UNet2DConditionModel, DDIMScheduler
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from transformers import CLIPTokenizer, CLIPTextModel
 import re
@@ -21,11 +22,11 @@ print("imports finished")
 
 @dataclass
 class TrainingConfig:
-    image_size = 512 #default 128  # the generated image resolution
+    image_size = 256 #default 128  # the generated image resolution
     train_batch_size = 16
     eval_batch_size = 10 # how many images to sample during evaluation
     num_epochs = 70 #default 50
-    gradient_accumulation_steps = 1
+    gradient_accumulation_steps = 4
     learning_rate = 1e-4
     lr_warmup_steps = 500#default 500
     save_image_epochs = 10#default 10
@@ -34,6 +35,8 @@ class TrainingConfig:
     output_dir = "food-test"  # the model name locally and on the HF Hub
     pretrained_model_name_or_path = "openai/clip-vit-base-patch32"  # The text encoder
 
+    cfg_dropout_prob = 0.1
+    guidance_scale = 7.5
 
     push_to_hub = False # whether to upload the saved model to the HF Hub
     hub_model_id = "<your-username>/<my-awesome-model>"  # the name of the repository to create on the HF Hub
@@ -76,6 +79,12 @@ model = UNet2DConditionModel(
 
 noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
 
+# We still train with DDPM (above), but at eval time DDIM lets us sample
+# much more effiecently, and typically produces sharper images.
+
+ddim_scheduler = DDIMScheduler.from_config(noise_scheduler.config)
+ddim_scheduler.set_timesteps(50)  # 50 steps is usually plenty; try 30-100
+
 
 # resize image into same size
 preprocess = transforms.Compose(
@@ -99,13 +108,15 @@ def transform(instance):
         food_name = instance["food101_class_name"][i]
 
         raw_text = instance["qwen3_vl_8b_yaml_out"][i]
+
+        '''
         if raw_text:
             ingredients = re.sub(r'\s*\(.*?\)', '', raw_text).strip()
         else:
             ingredients = "Various ingrediants"
         food_description = instance["output_label_json"][i]
-
-        prompt = f"Make me {food_name} {food_description} made out of {ingredients}"
+        '''
+        prompt = f"{food_name}"
 
         captions.append(prompt)
 
@@ -141,8 +152,9 @@ lr_scheduler = get_cosine_schedule_with_warmup(
 
 def evaluate(config, epoch, model, noise_scheduler, text_encoder, tokenizer, device):
     # Define a prompt to test
-    prompt = ["A hamburger with cheese and lettuce", "A delicious slice of pizza with various ingrediants", "Sushi rolls on a plate",
-              "Ice cream with chocolate sauce"]
+    prompt = ["A hamburger with cheese and lettuce", "A slice of pizza", "Sushi",
+              "Ice cream with chocolate sauce", "french_toast", "french toast",
+              "french fries", "donuts", "lasagna"]
     # Adjust prompt list size to match eval_batch_size
     prompt = prompt[:config.eval_batch_size]
 
@@ -157,21 +169,49 @@ def evaluate(config, epoch, model, noise_scheduler, text_encoder, tokenizer, dev
     with torch.no_grad():
         text_embeddings = text_encoder(text_inputs.input_ids.to(device))[0]
 
+    uncond_inputs = tokenizer(
+        [""] * len(prompt),
+        padding="max_length",
+        max_length=tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt"
+    )
+    with torch.no_grad():
+        uncond_embeddings = text_encoder(uncond_inputs.input_ids.to(device))[0]
+
+    combined_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+
     # 2. Prepare random noise
     images = torch.randn(
         (len(prompt), model.config.in_channels, model.config.sample_size, model.config.sample_size),
         device=device,
     )
 
+    inference_scheduler = DDIMScheduler.from_config(noise_scheduler.config)
+    inference_scheduler.set_timesteps(50)
+
     # 3. Denoising Loop
     model.eval()
-    for t in tqdm(noise_scheduler.timesteps, desc="Sampling"):
+    for t in tqdm(inference_scheduler.timesteps, desc="Sampling"):
         with torch.no_grad():
-            # Apply classifier-free guidance if you wanted to, but for now simple conditioning:
-            model_output = model(images, t, encoder_hidden_states=text_embeddings).sample
+            latent_input = torch.cat([images] * 2)
 
+            noise_pred = model(
+                latent_input, t, encoder_hidden_states=combined_embeddings
+            ).sample
+
+            noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+
+            # [CHANGE 6] CFG formula:
+            # Start from the unconditioned prediction, then PUSH toward the
+            # text-conditioned prediction by guidance_scale amount.
+            # guidance_scale=1.0 means no guidance (same as before).
+            # guidance_scale=7.5 means "strongly follow the text prompt".
+            noise_pred = noise_pred_uncond + config.guidance_scale * (
+                    noise_pred_cond - noise_pred_uncond
+            )
             # Update images using scheduler
-            images = noise_scheduler.step(model_output, t, images).prev_sample
+            images = inference_scheduler.step(noise_pred, t, images).prev_sample
 
     # 4. Save Images
     images = (images / 2 + 0.5).clamp(0, 1)
@@ -188,7 +228,7 @@ def evaluate(config, epoch, model, noise_scheduler, text_encoder, tokenizer, dev
 
     model.train()  # Set back to train mode
 
-def train_loop(TrainingConfig, model, noise_scheduler, optimizer, train_dataloader, lr_scheduler):
+def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, lr_scheduler):
     # Initialize accelerator and tensorboard logging
     accelerator = Accelerator(
         mixed_precision=TrainingConfig.mixed_precision,
@@ -240,6 +280,12 @@ def train_loop(TrainingConfig, model, noise_scheduler, optimizer, train_dataload
                 # If using accelerator, it handles device placement usually,
                 # but ensure text_encoder is moved to accelerator.device before the loop starts
                 encoder_hidden_states = text_encoder(input_ids.to(accelerator.device))[0]
+
+            # with all zeros (null conditioning). This forces the model to learn
+            # to denoise without any text signal, which is REQUIRED for CFG
+            # to work at inference time. Without this, CFG won't help at all.
+            if random.random() < TrainingConfig.cfg_dropout_prob:
+                encoder_hidden_states = torch.zeros_like(encoder_hidden_states)
 
             # Add noise to the clean images according to the noise magnitude at each timestep
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
