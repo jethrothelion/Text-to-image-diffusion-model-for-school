@@ -15,7 +15,9 @@ import torch.nn.functional as F
 from diffusers import DDPMScheduler, DDPMPipeline, UNet2DConditionModel, DDIMScheduler
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from transformers import CLIPTokenizer, CLIPTextModel
-import re
+import requests
+from PIL import Image
+from io import BytesIO
 
 print("imports finished")
 
@@ -96,27 +98,26 @@ preprocess = transforms.Compose(
     ]
 )
 
+def download_image(url):
+    response = requests.get(url)
+    return Image.open(BytesIO(response.content)).convert("RGB")
+
 #transform data to be ready to train
 def transform(instance):
-    images = [preprocess(image.convert("RGB")) for image in instance["image"]]
+    images = [preprocess(download_image(url)) for url in instance["coco_url"]]
     captions = []
 
 
     #for every image in the dataset
     for i in range(len(instance["image"])):
 
-        food_name = instance["food101_class_name"][i]
+        #test line so dont have to download on home machine
+        #prompt = random.choice(instance["captions"][i])
 
-        raw_text = instance["qwen3_vl_8b_yaml_out"][i]
-
-        '''
-        if raw_text:
-            ingredients = re.sub(r'\s*\(.*?\)', '', raw_text).strip()
-        else:
-            ingredients = "Various ingrediants"
-        food_description = instance["output_label_json"][i]
-        '''
-        prompt = f"{food_name}"
+        print(instance["captions"][0])
+        print(type(instance["captions"][0]))
+        caption_list = instance["captions"][i].split(", ")
+        prompt = random.choice(caption_list) #choose a random caption
 
         captions.append(prompt)
 
@@ -133,7 +134,7 @@ def transform(instance):
     }
 
 
-dataset = load_dataset("mrdbourke/FoodExtract-1k-Vision", split="train")
+dataset = load_dataset("nirmalendu01/animal_dataset", split="train")
 
 
 # Apply the transform to the dataset
